@@ -42,6 +42,24 @@ function getEscapedDatabaseName(name) {
   return mysqlCore.escapeId(name);
 }
 
+async function ensureLogsTableColumns() {
+  const requiredColumns = [
+    { name: "employee_id", definition: "INT NULL" },
+    { name: "employee_name", definition: "VARCHAR(255) NULL" },
+    { name: "rfid_uid", definition: "VARCHAR(100) NULL" }
+  ];
+
+  const [rows] = await pool.execute("SHOW COLUMNS FROM logs");
+  const existingColumns = new Set(rows.map((row) => row.Field));
+
+  for (const column of requiredColumns) {
+    if (!existingColumns.has(column.name)) {
+      console.log(`[DB] Adding missing logs column: ${column.name}`);
+      await pool.execute(`ALTER TABLE logs ADD COLUMN ${column.name} ${column.definition}`);
+    }
+  }
+}
+
 async function initializeDatabase() {
   try {
     const adminPool = mysql.createPool({
@@ -75,6 +93,8 @@ async function initializeDatabase() {
       )`
     );
 
+    await ensureLogsTableColumns();
+
     const connection = await pool.getConnection();
     await connection.ping();
     connection.release();
@@ -92,8 +112,49 @@ app.get("/test", (_req, res) => {
   });
 });
 
+app.post("/verify-rfid", async (req, res) => {
+  const { rfid_uid } = req.body;
+
+  console.log("[POST /verify-rfid] Incoming data:", req.body);
+
+  if (!rfid_uid || typeof rfid_uid !== "string" || !rfid_uid.trim()) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid input: rfid_uid is required"
+    });
+  }
+
+  try {
+    const sql = "SELECT id, name FROM employees WHERE rfid_uid = ? AND status = 'active'";
+    const [rows] = await pool.execute(sql, [rfid_uid.trim()]);
+
+    console.log("[POST /verify-rfid] Query result count:", rows.length);
+
+    if (!rows.length) {
+      return res.json({
+        success: false,
+        message: "Employee not found"
+      });
+    }
+
+    const employee = rows[0];
+
+    return res.json({
+      success: true,
+      employee_id: employee.id,
+      name: employee.name
+    });
+  } catch (error) {
+    console.error("[POST /verify-rfid] Error verifying RFID:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Database query failed"
+    });
+  }
+});
+
 app.post("/machine-done", async (req, res) => {
-  const { esp_id, column, machine } = req.body;
+  const { esp_id, employee_id, rfid_uid, column, machine } = req.body;
 
   console.log("[POST /machine-done] Incoming data:", req.body);
 
@@ -101,6 +162,20 @@ app.post("/machine-done", async (req, res) => {
     return res.status(400).json({
       success: false,
       message: "Invalid input: esp_id is required"
+    });
+  }
+
+  if (!isValidNumber(employee_id)) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid input: employee_id must be a number"
+    });
+  }
+
+  if (!rfid_uid || typeof rfid_uid !== "string" || !rfid_uid.trim()) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid input: rfid_uid is required"
     });
   }
 
@@ -119,18 +194,35 @@ app.post("/machine-done", async (req, res) => {
   }
 
   try {
-    const sql = "INSERT INTO logs (esp_id, column_no, machine_no) VALUES (?, ?, ?)";
-    await pool.execute(sql, [esp_id.trim(), column, machine]);
+    const employeeSql = "SELECT name FROM employees WHERE id = ?";
+    const [employeeRows] = await pool.execute(employeeSql, [employee_id]);
+
+    console.log("[POST /machine-done] Employee lookup result count:", employeeRows.length);
+
+    if (!employeeRows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Employee not found"
+      });
+    }
+
+    const employeeName = employeeRows[0].name;
+
+    const sql = "INSERT INTO logs (esp_id, employee_id, employee_name, rfid_uid, column_no, machine_no) VALUES (?, ?, ?, ?, ?, ?)";
+    await pool.execute(sql, [esp_id.trim(), employee_id, employeeName, rfid_uid.trim(), column, machine]);
 
     console.log("[POST /machine-done] DB insert success:", {
       esp_id: esp_id.trim(),
+      employee_id,
+      employee_name: employeeName,
+      rfid_uid: rfid_uid.trim(),
       column,
       machine
     });
 
     return res.json({
       success: true,
-      message: "Data inserted"
+      message: "Log saved"
     });
   } catch (error) {
     console.error("[POST /machine-done] Error inserting log:", error);
@@ -143,7 +235,7 @@ app.post("/machine-done", async (req, res) => {
 
 app.get("/logs", async (_req, res) => {
   try {
-    const sql = "SELECT id, esp_id, column_no, machine_no, time FROM logs ORDER BY time DESC, id DESC";
+    const sql = "SELECT id, esp_id, employee_id, employee_name, rfid_uid, column_no, machine_no, time FROM logs ORDER BY time DESC, id DESC";
     const [rows] = await pool.execute(sql);
 
     return res.json(rows);
